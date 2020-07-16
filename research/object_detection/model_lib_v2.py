@@ -415,6 +415,10 @@ def train_loop(
     save_final_config=False,
     checkpoint_every_n=1000,
     checkpoint_max_to_keep=7,
+    sample_1_of_n_eval_examples=1,
+    sample_1_of_n_eval_on_train_examples=1,
+    override_eval_num_epochs=True,
+    postprocess_on_cpu=False,
     **kwargs):
   """Trains a model using eager + functions.
 
@@ -465,6 +469,18 @@ def train_loop(
   model_config = configs['model']
   train_config = configs['train_config']
   train_input_config = configs['train_input_config']
+  eval_config = configs['eval_config']
+  eval_input_configs = configs['eval_input_configs']
+  eval_on_train_input_config = copy.deepcopy(train_input_config)
+  eval_on_train_input_config.sample_1_of_n_examples = (
+    sample_1_of_n_eval_on_train_examples)
+  if override_eval_num_epochs and eval_on_train_input_config.num_epochs != 1:
+    tf.logging.warning('Expected number of evaluation epochs is 1, but '
+                       'instead encountered `eval_on_train_input_config'
+                       '.num_epochs` = '
+                       '{}. Overwriting `num_epochs` to 1.'.format(
+      eval_on_train_input_config.num_epochs))
+    eval_on_train_input_config.num_epochs = 1
 
   unpad_groundtruth_tensors = train_config.unpad_groundtruth_tensors
   add_regularization_loss = train_config.add_regularization_loss
@@ -511,8 +527,17 @@ def train_loop(
       return train_input
 
     train_input = strategy.experimental_distribute_datasets_from_function(
-        train_dataset_fn)
+      train_dataset_fn)
 
+    # Create eval inputs.
+    eval_inputs = []
+    for eval_input_config in eval_input_configs:
+      next_eval_input = inputs.eval_input(
+        eval_config=eval_config,
+        eval_input_config=eval_input_config,
+        model_config=model_config,
+        model=detection_model)
+      eval_inputs.append((eval_input_config.name, next_eval_input))
 
     global_step = tf.Variable(
         0, trainable=False, dtype=tf.compat.v2.dtypes.int64, name='global_step',
@@ -607,6 +632,19 @@ def train_loop(
 
           return _sample_and_train(strategy, train_step_fn, data_iterator)
 
+        def eval_step_fn(checkpoint):
+          ckpt.restore(checkpoint).expect_partial()
+          for eval_name, eval_input in eval_inputs:
+            summary_writer = tf.compat.v2.summary.create_file_writer(
+              os.path.join(model_dir, 'eval', eval_name))
+            with summary_writer.as_default():
+              eager_eval_loop(detection_model,
+                              configs,
+                              eval_input,
+                              use_tpu=use_tpu,
+                              postprocess_on_cpu=postprocess_on_cpu,
+                              global_step=global_step)
+
         train_input_iter = iter(train_input)
 
         if int(global_step.value()) == 0:
@@ -639,6 +677,12 @@ def train_loop(
               checkpoint_every_n):
             manager.save()
             checkpointed_step = int(global_step.value())
+
+          latest_checkpoint_tmp = tf.train.latest_checkpoint(model_dir)
+          if latest_checkpoint_tmp != latest_checkpoint:
+            latest_checkpoint = latest_checkpoint_tmp
+            tf.logging.info('Running Evaluation for step {}...'.format(global_step.value()))
+            eval_step_fn(latest_checkpoint)
 
   # Remove the checkpoint directories of the non-chief workers that
   # MultiWorkerMirroredStrategy forces us to save during sync distributed
